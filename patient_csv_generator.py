@@ -1,0 +1,827 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import re
+import psycopg2
+import csv
+import gc
+from pathlib import Path
+from psycopg2 import sql
+from operator import itemgetter
+from collections import defaultdict, deque
+from psycopg2.extras import execute_values
+
+# Define the list of allowed features for the neural network (request of the professor)
+ALLOWED_NN_PROPS = {
+    # Raw properties
+    "Arter", "Azotemia Post", "Azotemia Pre", "BCM post", "BMI", 
+    "FFM post", "FM post", "Peso Post", "Peso Pre", "QB Medio", 
+    "QB Totale", "Score CVC", "Score FAV", "Tipo Accesso Vascolare", 
+    "Vena", "Vitamina D",
+    # Dependent properties
+    "A/V", "Mesi CVC", "Mesi FAV", "Minuti Dialisi", "Ore Dialisi", 
+    "PA/QB", "PV/QB", "QB", "TSAT", "UF", "UF Tot"
+}
+
+# get environment variable with optional default and required flag
+def get_env(name, default=None, required=False):
+    v = os.environ.get(name, default)
+    print(f"[python-runner] Env var {name} = {v}")
+    if required and not v:
+        print(f"Missing required env var: {name}")
+        sys.exit(1)
+    return v
+
+# connect to Postgres DB
+def connect(dbname, user, password, host, port, autocommit=False):
+    conn = psycopg2.connect(dbname=dbname, user=user, password=password, host=host, port=port)
+    conn.autocommit = autocommit
+    return conn
+
+# wait for DB to be ready
+def wait_for_db(host, port, user, password, dbname, timeout=60, interval=2):
+    start = time.time()
+    last_exc = None
+    while True:
+        try:
+            conn = psycopg2.connect(dbname=dbname, user=user, password=password, host=host, port=port)
+            conn.close()
+            return True
+        except Exception as e:
+            last_exc = e
+            if time.time() - start >= timeout:
+                print(f"[python-runner] Timeout waiting for DB ({timeout}s): {last_exc}")
+                return False
+            print("[python-runner] DB not ready, retrying in {0}s...".format(interval))
+            time.sleep(interval)
+
+# clean birthday values
+def clean_birthday_rows(rows):
+    out = []
+    pattern = re.compile(r'"([^"]+)"')
+    for r in rows:
+        try:
+            pid = r[0]
+            raw = r[1]
+        except Exception:
+            continue
+
+        if raw is None:
+            ts = None
+        elif isinstance(raw, str):
+            m = pattern.search(raw)
+            if m:
+                ts = m.group(1)
+            else:
+                t = raw.strip()
+                if t.startswith('(') and t.endswith(')'):
+                    t = t[1:-1]
+                ts = t.split(',', 1)[0].strip().strip('"').strip("'")
+        else:
+            ts = str(raw)
+
+        out.append((pid, ts))
+    return out
+
+# process generality_list
+def process_generality_list(generality_list):
+    result = defaultdict(lambda: [None, None, None, None])
+    prop_index = {
+        'Birthday': 0, 'Data Nascita': 0,
+        'Gender': 1, 'Sesso': 1,
+        'Height': 2, 'Altezza': 2,
+        'Etnicity': 3, 'Ethnicity': 3, 'Etnia': 3,
+    }
+    ts_pattern = re.compile(r'"([^\"]+)"')
+
+    for row in generality_list:
+        if not row or len(row) < 3:
+            continue
+        pid, prop, raw = row[0], row[1], row[2]
+        if pid is None:
+            continue
+
+        idx = prop_index.get(prop)
+        if idx is None:
+            continue
+
+        value_str = None
+        if raw is None:
+            value_str = None
+        else:
+            s = str(raw).strip()
+            if idx == 0:
+                m = ts_pattern.search(s)
+                if m:
+                    value_str = m.group(1)
+                else:
+                    if s.startswith('(') and s.endswith(')'):
+                        inner = s[1:-1]
+                    else:
+                        inner = s
+                    value_str = inner.split(',', 1)[0].strip().strip('"').strip("'")
+            else:
+                if s.startswith('(') and s.endswith(')'):
+                    inner = s[1:-1]
+                else:
+                    inner = s
+                value_str = inner.split(',', 1)[0].strip().strip('"').strip("'")
+
+        result[pid][idx] = value_str
+
+    return dict(result)
+
+# clean death_list entries
+def clean_death_list(rows):
+    out = {}
+    pattern = re.compile(r'^\s*(?P<patient_id>[^\[\s]+)\s*\[\s*(?P<first>[^,\]]+)')
+    for r in rows:
+        if not r:
+            continue
+        raw = r[0] if isinstance(r, (list, tuple)) else r
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        m = pattern.search(s)
+        if m:
+            patient_id = m.group('patient_id').strip()
+            ts = m.group('first').strip().strip('"').strip("'")
+            out[patient_id] = ts
+            continue
+
+        if '[' in s:
+            before, after = s.split('[', 1)
+            patient_id = before.strip()
+            first = after.split(',', 1)[0].strip().strip(']').strip().strip('"').strip("'")
+            out[patient_id] = first
+        else:
+            out[s] = None
+    return out
+
+# return list of CSV files in a directory
+def file_list(directory):
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f"Directory does not exist: {directory}")
+    return [
+        os.path.join(directory, nome)
+        for nome in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, nome)) and nome.endswith('.csv')
+    ]
+
+# normalize gender
+def normalize_gender(raw_gender):
+    if raw_gender is None:
+        return None
+    g = str(raw_gender).strip().lower()
+    gender_map = {
+        'm': 'M', 'maschio': 'M', 'male': 'M',
+        'f': 'F', 'femmina': 'F', 'female': 'F',
+        'unknown': 'Unknown', 'sconosciuto': 'Unknown',
+    }
+    return gender_map.get(g, 'Unknown')
+
+# normalize ethnicity
+def normalize_ethnicity(raw_ethnicity):
+    if raw_ethnicity is None:
+        return None
+    e = str(raw_ethnicity).strip()
+    ethnicity_map = {
+        'caucasica': 'Caucasian', 'caucasian': 'Caucasian',
+        'etiopica': 'Ethiopian', 'ethiopian': 'Ethiopian',
+        'americana': 'American', 'american': 'American',
+        'africana': 'African', 'african': 'African',
+        'asiatica': 'Asian', 'asian': 'Asian',
+        'ispanica': 'Hispanic', 'hispanic': 'Hispanic',
+        'malese': 'Malaysian', 'malaysian': 'Malaysian',
+        'mongolica': 'Mongolian', 'mongolian': 'Mongolian',
+        'other': 'Other', 'altro': 'Other',
+    }
+    return ethnicity_map.get(e.lower(), 'Other')
+
+# map raw domain type
+def map_to_domain_type(domain_row):
+    if not domain_row or not domain_row[0]:
+        return None
+    raw = domain_row[0].strip().lower()
+    if raw in ('real', 'double precision', 'numeric', 'decimal'): return 'real'
+    if raw in ('float'): return 'float'
+    if raw in ('smallint', 'integer', 'bigint', 'int'): return 'discrete'
+    if raw in ('timestamp', 'time', 'datetime', 'date'): return 'time'
+    if raw in ('string', 'str', 'text', 'varchar', 'char'): return 'string'
+    return 'string'
+
+# create custom domains and tables
+def create_domains_and_tables(cur):
+    cur.execute("""CREATE TYPE GenderType AS ENUM ('M', 'F', 'Unknown'); 
+                CREATE TYPE Ethnicity AS ENUM ('American', 'Caucasian', 'African', 'Asian', 'Hispanic', 'Ethiopian', 'Malaysian', 'Mongolian', 'Other'); 
+                CREATE TYPE DomainType AS ENUM ('real', 'discrete', 'string', 'time', 'float'); CREATE TYPE WindowType AS ENUM ('3m', '6m', '1y'); 
+                CREATE DOMAIN String4PatientId AS CHAR(24);CREATE DOMAIN String4VarName AS VARCHAR(67);CREATE DOMAIN String4EventType AS VARCHAR(100);
+                CREATE TYPE EventType AS ENUM ('Dati Anemia', 'Dati CKD-MBD', 'Dati Nutrizione', 'Ricovero', 'Seduta di dialisi');""")
+    
+    cur.execute("""CREATE TABLE Patient (
+                    patient_id String4PatientId PRIMARY KEY,     
+                    date_of_birth timestamp NOT NULL,
+                    date_of_death timestamp,                      
+                    gender GenderType,
+                    ethnicity Ethnicity,
+                    height REAL
+                );""")
+    
+    cur.execute("""CREATE TABLE Measurements (
+            patient_ID String4PatientId NOT NULL,
+            event_ID String4EventType,
+            interval timestamp NOT NULL,
+            event_type EventType,
+            property VARCHAR(100) NOT NULL,
+            value VARCHAR(100) NOT NULL,
+            PRIMARY KEY (patient_ID, interval, property),
+            CONSTRAINT patient_ref FOREIGN KEY(patient_ID) REFERENCES Patient(patient_id)
+        );""")
+    
+    cur.execute("""CREATE TABLE DependentProperties (
+            patient_ID String4PatientId NOT NULL,
+            interval timestamp NOT NULL,
+            property VARCHAR(100) NOT NULL,
+            value VARCHAR(100) NOT NULL,
+            PRIMARY KEY (patient_ID, interval, property),
+            CONSTRAINT patient_ref FOREIGN KEY(patient_ID) REFERENCES Patient(patient_id)
+        );""")
+    
+    cur.execute("""CREATE TABLE TimeVar (
+        var_id SERIAL PRIMARY KEY,
+        var_name String4VarName NOT NULL UNIQUE,
+        var_domain DomainType NOT NULL,
+        lower_bound REAL NOT NULL,
+        upper_bound REAL NOT NULL,
+        average DOUBLE PRECISION NOT NULL,
+        std_dev DOUBLE PRECISION NOT NULL
+    );""")
+    
+    cur.execute("""CREATE TABLE TimeSeries (
+        time timestamp NOT NULL,
+        pid String4PatientId NOT NULL,
+        tid int NOT NULL,
+        varvalue REAL NOT NULL,
+    	PRIMARY KEY (time, pid, tid),
+        CONSTRAINT pid_ref FOREIGN KEY(pid) REFERENCES Patient(patient_id),
+        CONSTRAINT tid_ref FOREIGN KEY(tid) REFERENCES TimeVar(var_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_timeseries_pid ON TimeSeries (pid);""")
+    
+    cur.execute("""CREATE TABLE NN_Training_Dataset (
+        timestamp timestamp NOT NULL,
+        patient_id String4PatientId NOT NULL,
+        misure DOUBLE PRECISION[] NOT NULL,
+        aggregati_10 DOUBLE PRECISION[] NOT NULL,
+        aggregati_20 DOUBLE PRECISION[] NOT NULL,
+        aggregati_30 DOUBLE PRECISION[] NOT NULL,
+        tte INTEGER NOT NULL,
+        PRIMARY KEY (timestamp, patient_id),
+        CONSTRAINT patient_ref FOREIGN KEY(patient_id) REFERENCES Patient(patient_id)
+    );""")
+
+# insert patients
+def insert_patients(cur, birthday_rows, dest_conn, patients_list, death_dict, generality_dict):
+    query = """
+                INSERT INTO Patient (patient_id, date_of_birth)
+                VALUES (%s, %s)
+                ON CONFLICT (patient_id)
+                DO UPDATE SET date_of_birth = EXCLUDED.date_of_birth;
+            """
+    cur.executemany(query, birthday_rows)
+    dest_conn.commit()
+    
+    for patient_id, dob in birthday_rows:
+        cur.execute("""
+            UPDATE Patient
+            SET date_of_birth = %s
+            WHERE patient_id = %s;
+        """, (dob, patient_id))
+        dest_conn.commit()
+
+    for patient_id in patients_list:
+        if patient_id in death_dict:
+            death_date = death_dict[patient_id]
+            cur.execute("""
+                UPDATE Patient
+                SET date_of_death = %s
+                WHERE patient_id = %s;
+            """, (death_date, patient_id))
+            dest_conn.commit()
+        if patient_id in generality_dict:
+            gender = normalize_gender(generality_dict[patient_id][1])
+            height = generality_dict[patient_id][2]
+            ethnicity = normalize_ethnicity(generality_dict[patient_id][3])
+
+            cur.execute("""
+                UPDATE Patient
+                SET gender = %s, height = %s, ethnicity = %s
+                WHERE patient_id = %s;
+            """, (gender, height, ethnicity, patient_id))
+            dest_conn.commit()
+
+def stream_and_insert_measures(db_params_src, dest_conn, birthday_by_patient):
+    dbname, user, password, host, port = db_params_src
+    read_conn = connect(dbname, user, password, host, port)
+    batch = []
+    batch_size = 5000 
+    try:
+        with read_conn.cursor(name='src_measures_reader') as read_cur, dest_conn.cursor() as write_cur:
+            read_cur.itersize = batch_size
+            read_cur.execute("""
+                SELECT patient, interval, property, event, value 
+                FROM patient.propertymeasure 
+                WHERE property NOT IN ('Data Nascita', 'Sesso', 'Altezza', 'Etnia');
+            """)
+            
+            for row in read_cur:
+                patient_id, interval, property, event, value = row
+                clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
+                
+                if clean_pid not in birthday_by_patient.keys():
+                    continue
+                
+                if interval is not None and hasattr(interval, 'lower'):
+                    interval_str = str(interval.lower) if interval.lower is not None else None
+                else:
+                    interval_str = str(interval) if interval else None
+                    
+                batch.append((clean_pid, interval_str, event, property, value))
+                
+                if len(batch) >= batch_size:
+                    execute_values(write_cur, """
+                        INSERT INTO Measurements (patient_ID, interval, event_ID, property, value)
+                        VALUES %s;
+                    """, batch)
+                    dest_conn.commit()
+                    batch.clear()
+                    
+            if batch:
+                execute_values(write_cur, """
+                    INSERT INTO Measurements (patient_ID, interval, event_ID, property, value)
+                    VALUES %s;
+                """, batch)
+                dest_conn.commit()
+    finally:
+        read_conn.close()
+
+def find_property_name(property_name):
+    # Exact mapping based on filenames in the dependent_properties directory
+    mapping = {
+        "Alpha_EPODose_Weight": "Alpha EPODose Weight",
+        "Alpha_ERI": "Alpha ERI",
+        "FosfAlcIndex": "FosfAlcIndex",
+        "Mesi_CVC": "Mesi CVC",
+        "Mesi_FAV": "Mesi FAV",
+        "Minuti_Dialisi": "Minuti Dialisi",
+        "Ore_Dialisi": "Ore Dialisi",
+        "PA_QB": "PA/QB",
+        "PV_QB": "PV/QB",
+        "TSAT": "TSAT",
+        "UF": "UF",
+        "UF_Tot": "UF Tot",
+        "av": "A/V",
+        "qb": "QB",
+    }
+    if property_name in mapping:
+        return mapping[property_name]
+    
+    # Fallback to normalized comparison in case underscores or cases differ
+    p = property_name.lower().replace("_", "")
+    fallback_mapping = {
+        "tsat": "TSAT",
+        "qb": "QB",
+        "fosfalcindex": "FosfAlcIndex",
+        "mesifav": "Mesi FAV",
+        "alphaepodoseweight": "Alpha EPODose Weight",
+        "pvqb": "PV/QB",
+        "paqb": "PA/QB",
+        "oredialisi": "Ore Dialisi",
+        "alphaeri": "Alpha ERI",
+        "uftot": "UF Tot",
+        "mesicvc": "Mesi CVC",
+        "av": "A/V",
+        "minutidialisi": "Minuti Dialisi",
+        "uf": "UF",
+    }
+    return fallback_mapping.get(p, property_name)
+
+def process_single_property_file(file, db_params, birthday_by_patient):
+    basename = os.path.basename(file)
+    if basename.endswith('.csv'):
+        basename = basename[:-4]
+    property_name = basename.removeprefix('derived_prop_')
+    property_name = find_property_name(property_name)
+    
+    print(f"[python-runner] Executing: {file} - {property_name}")
+    dbname, user, password, host, port = db_params
+    conn = connect(dbname, user, password, host, port)
+    try:
+        with conn.cursor() as cur:
+            with open(file, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                chunk = []
+                chunk_size = 5000
+                
+                for row in reader:
+                    if len(row) < 3:
+                        continue
+                    patient_id, interval, value = row[0], row[1], row[2]
+                    clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
+                    
+                    if clean_pid not in birthday_by_patient:
+                        continue
+                    chunk.append((clean_pid, interval, property_name, value))
+                    
+                    if len(chunk) >= chunk_size:
+                        execute_values(cur, """
+                            INSERT INTO DependentProperties (patient_ID, interval, property, value)
+                            VALUES %s;
+                        """, chunk)
+                        conn.commit()
+                        chunk.clear()
+                        
+                if chunk:
+                    execute_values(cur, """
+                        INSERT INTO DependentProperties (patient_ID, interval, property, value)
+                        VALUES %s;
+                    """, chunk)
+                    conn.commit()
+    finally:
+        conn.close()
+
+def insert_timevar_table(cur, dest_conn):
+    properties=["Albuminemia", "Arter", "Azotemia Post", "Azotemia Pre", "BCM post", "BMI", "Bicarbonatemia", "Calcemia", "Circonferenza Braccio", "Colesterolemia", "DEI", "DPI", "Dosaggio Epoetina Alpha mensile", "FFM post", "FM post", "Ferritina", "Fosfatasi Alcalina", "Fosforemia", "Hb", "PTH", "Peso Post", "Peso Pre", "QB Medio", "QB Totale", "Score CVC", "Score FAV", "Sideremia", "Tipo Accesso Vascolare", "Transferrina", "Vena","Vitamina D"]
+    dependent_properties=["A/V", "Alpha EPODose Weight", "Alpha ERI", "FosfAlcIndex", "Mesi CVC", "Mesi FAV","Minuti Dialisi", "Ore Dialisi", "PA/QB", "PV/QB", "QB", "TSAT", "UF", "UF Tot"]
+
+    for property in properties:
+        domain = """SELECT trim(split_part(trim(both '()' FROM value), ',', 2)) AS value_type
+            FROM measurements WHERE property = %s LIMIT 1;"""
+        cur.execute(domain, (property,))
+        res = cur.fetchone()
+        domain_result = map_to_domain_type(res) if res else None
+        if domain_result in ('real','float', 'discrete'):
+            q = """WITH prop_values AS (
+                  SELECT CASE
+                      WHEN split_part(trim(both '()' from value), ',', 1) ~ '^[+-]?([0-9]*[.])?[0-9]+([eE][+-]?[0-9]+)?$'
+                      THEN split_part(trim(both '()' from value), ',', 1)::double precision
+                    END AS v
+                  FROM measurements WHERE property = %s
+                )
+                SELECT MIN(v), MAX(v), AVG(v), STDDEV_SAMP(v) FROM prop_values;"""
+            cur.execute(q, (property,))
+            min_val, max_val, average, dev_std = cur.fetchone()
+            if average is not None:
+                cur.execute("""INSERT INTO TimeVar (var_name, var_domain, lower_bound, upper_bound, average, std_dev)
+                            VALUES (%s, %s, %s, %s, %s, %s);""", (property, domain_result, min_val, max_val, average, dev_std))
+                dest_conn.commit()
+
+    for property in dependent_properties:
+        domain = """SELECT trim(split_part(trim(both '()' FROM value), ',', 2)) AS value_type
+            FROM dependentproperties WHERE property = %s LIMIT 1;"""
+        cur.execute(domain, (property,))
+        res = cur.fetchone()
+        domain_result = map_to_domain_type(res) if res else None
+        if domain_result not in ('real','float', 'discrete'):
+            continue
+        
+        q = """WITH prop_values AS (
+              SELECT CASE
+                  WHEN split_part(trim(both '()' from value), ',', 1) ~ '^[+-]?([0-9]*[.])?[0-9]+([eE][+-]?[0-9]+)?$'
+                  THEN split_part(trim(both '()' from value), ',', 1)::double precision
+                END AS v
+              FROM dependentproperties WHERE property = %s
+            )
+            SELECT MIN(v), MAX(v), AVG(v), STDDEV_SAMP(v) FROM prop_values;"""
+        cur.execute(q, (property,))
+        min_val, max_val, average, dev_std = cur.fetchone()
+        if average is not None:
+            cur.execute("""INSERT INTO TimeVar (var_name, var_domain, lower_bound, upper_bound, average, std_dev)
+                        VALUES (%s, %s, %s, %s, %s, %s);""", (property, domain_result, min_val, max_val, average, dev_std))
+            dest_conn.commit()
+
+def insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_params):
+    batch = []
+    batch_size = 5000 
+    print("[python-runner] Inserting Raw Measurements into TimeSeries (FILTERED)...")
+    dbname, user, password, host, port = db_params
+    read_conn = connect(dbname, user, password, host, port)
+    
+    try:
+        with read_conn.cursor(name='meas_reader') as read_cur, dest_conn.cursor() as write_cur:
+            read_cur.itersize = batch_size
+            read_cur.execute("SELECT patient_ID, interval, property, value FROM Measurements;")
+            
+            for patient_id, interval, property, value in read_cur:
+                if property not in ALLOWED_NN_PROPS:
+                    continue
+
+                clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
+                if clean_pid not in birthday_by_patient:
+                    continue
+                if property in property_tid:
+                    tid = property_tid[property]
+                    time_value = interval.lower if hasattr(interval, 'lower') else interval
+                    if time_value is None:
+                        continue
+                    
+                    if value is not None and isinstance(value, str) and value.strip() != '':
+                        try:
+                            numeric_value = float(value.strip().strip('()').split(',')[0])
+                            batch.append((time_value, clean_pid, tid, numeric_value))
+                        except ValueError:
+                            continue
+
+                if len(batch) >= batch_size:
+                    execute_values(write_cur, """
+                        INSERT INTO TimeSeries (time, pid, tid, varvalue)
+                        VALUES %s
+                        ON CONFLICT (time, pid, tid) DO UPDATE SET varvalue = EXCLUDED.varvalue;
+                    """, batch)
+                    dest_conn.commit()
+                    batch.clear()
+
+            if batch:
+                execute_values(write_cur, """
+                    INSERT INTO TimeSeries (time, pid, tid, varvalue)
+                    VALUES %s
+                    ON CONFLICT (time, pid, tid) DO UPDATE SET varvalue = EXCLUDED.varvalue;
+                """, batch)
+                dest_conn.commit()
+                batch.clear()
+
+        print("[python-runner] Inserting Dependent Properties into TimeSeries (FILTERED)...")
+        with read_conn.cursor(name='dep_props_reader') as read_cur, dest_conn.cursor() as write_cur:
+            read_cur.itersize = batch_size
+            read_cur.execute("SELECT patient_ID, interval, property, value FROM DependentProperties;")
+            
+            for patient_id, interval, property, value in read_cur:
+                if property not in ALLOWED_NN_PROPS:
+                    continue
+
+                clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
+                if clean_pid not in birthday_by_patient:
+                    continue
+                if property in property_tid:
+                    tid = property_tid[property]
+                    time_value = interval.lower if hasattr(interval, 'lower') else interval
+                    if time_value is None:
+                        continue
+                    if value is not None and isinstance(value, str) and value.strip() != '':
+                        try:
+                            numeric_value = float(value.strip().strip('()').split(',')[0])
+                            batch.append((time_value, clean_pid, tid, numeric_value))
+                        except ValueError:
+                            continue
+
+                if len(batch) >= batch_size:
+                    execute_values(write_cur, """
+                        INSERT INTO TimeSeries (time, pid, tid, varvalue)
+                        VALUES %s
+                        ON CONFLICT (time, pid, tid) DO UPDATE SET varvalue = EXCLUDED.varvalue;
+                    """, batch)
+                    dest_conn.commit()
+                    batch.clear()
+
+            if batch:
+                execute_values(write_cur, """
+                    INSERT INTO TimeSeries (time, pid, tid, varvalue)
+                    VALUES %s
+                    ON CONFLICT (time, pid, tid) DO UPDATE SET varvalue = EXCLUDED.varvalue;
+                """, batch)
+                dest_conn.commit()
+                batch.clear()
+    finally:
+        read_conn.close()
+
+def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, num_vars, max_session_time, db_params):
+    dbname, user, password, host, port = db_params
+    read_conn = connect(dbname, user, password, host, port)
+    write_conn = connect(dbname, user, password, host, port)
+    
+    inserted_count = 0
+    clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
+    
+    try:
+        cursor_name = f'pat_read_{re.sub("[^a-zA-Z0-9_]", "_", clean_pid)}'
+        with read_conn.cursor(name=cursor_name) as read_cur, write_conn.cursor() as write_cur:
+            read_cur.itersize = 2000
+            
+            read_cur.execute("""
+                SELECT time, tid, varvalue
+                FROM TimeSeries
+                WHERE pid = %s
+                ORDER BY time, tid;
+            """, (clean_pid,))
+
+            last_values = {vid: var_defaults[vid] for vid in var_ids}
+            window = deque(maxlen=30) 
+            
+            current_time = None
+            current_session_vals = {}
+            rows_to_insert = []
+            chunk_size = 500
+
+            def build_and_flush(time_stamp, vals):
+                nonlocal inserted_count
+                for vid, v in vals.items():
+                    last_values[vid] = v
+                vector = [last_values[vid] for vid in var_ids]
+                window.append(vector)
+                
+                w_list = list(window)
+                w_len = len(w_list)
+                l10, l20, l30 = min(10, w_len), min(20, w_len), min(30, w_len)
+                agg_10 = [sum(w[j] for w in w_list[-10:]) / l10 for j in range(num_vars)]
+                agg_20 = [sum(w[j] for w in w_list[-20:]) / l20 for j in range(num_vars)]
+                agg_30 = [sum(w[j] for w in w_list[-30:]) / l30 for j in range(num_vars)]
+
+                if date_of_death is not None:
+                    tte = max(0, (date_of_death - time_stamp).days)
+                else:
+                    tte = max(1, (max_session_time - time_stamp).days + 1)
+
+                rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, tte))
+
+                if len(rows_to_insert) >= chunk_size:
+                    execute_values(write_cur, """
+                        INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, tte)
+                        VALUES %s
+                        ON CONFLICT (timestamp, patient_id) DO NOTHING;
+                    """, rows_to_insert)
+                    write_conn.commit()
+                    inserted_count += len(rows_to_insert)
+                    rows_to_insert.clear()
+
+            for time_val, tid, val in read_cur:
+                if time_val != current_time:
+                    if current_time is not None:
+                        build_and_flush(current_time, current_session_vals)
+                    current_time = time_val
+                    current_session_vals = {}
+                current_session_vals[tid] = val
+
+            if current_time is not None:
+                build_and_flush(current_time, current_session_vals)
+
+            if rows_to_insert:
+                execute_values(write_cur, """
+                    INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, tte)
+                    VALUES %s
+                    ON CONFLICT (timestamp, patient_id) DO NOTHING;
+                """, rows_to_insert)
+                write_conn.commit()
+                inserted_count += len(rows_to_insert)
+
+        return inserted_count
+    
+    except Exception as e:
+        print(f"[python-runner] Failed patient {clean_pid}: {e}")
+        write_conn.rollback()
+        return 0
+    finally:
+        read_conn.close()
+        write_conn.close()
+
+def insert_nn_training_dataset_table(cur, dest_conn, db_params):
+    cur.execute("""
+        SELECT var_id, var_name, average 
+        FROM TimeVar 
+        WHERE var_name IN %s 
+        ORDER BY var_id;
+    """, (tuple(ALLOWED_NN_PROPS),))
+    
+    variables = cur.fetchall()
+    if not variables:
+        print("[python-runner] No variables found in TimeVar matching ALLOWED_NN_PROPS. Skipping.")
+        return
+
+    var_ids = [v[0] for v in variables]
+    var_defaults = {v[0]: v[2] for v in variables}
+    num_vars = len(var_ids)
+
+    cur.execute("SELECT MAX(time) FROM TimeSeries;")
+    res = cur.fetchone()
+    max_session_time = res[0] if res else None
+    if max_session_time is None:
+        print("[python-runner] No sessions found in TimeSeries. Skipping.")
+        return
+
+    cur.execute("SELECT patient_id, date_of_death FROM Patient;")
+    patients = cur.fetchall()
+
+    print(f"[python-runner] Starting NN processing for {len(patients)} patients with {num_vars} aggregated features...")
+
+    total_inserted = 0
+    for i, (patient_id, date_of_death) in enumerate(patients, 1):
+        inserted = process_patient_optimized(
+            patient_id, date_of_death, var_ids, var_defaults, num_vars, max_session_time, db_params
+        )
+        total_inserted += inserted
+        
+        if i % 50 == 0 or i == len(patients):
+            print(f"[python-runner] Progress: {i}/{len(patients)} patients completed. Inserted {total_inserted} rows...")
+            gc.collect() 
+
+    print(f"[python-runner] Completed NN_Training_Dataset. Total rows inserted: {total_inserted}")
+
+def main():
+    DB_HOST = get_env('DB_HOST', 'datalake_backend_db')
+    DB_PORT = get_env('DB_PORT', '5432')
+    DB_USER = get_env('DB_USER', required=True)
+    DB_PASS = get_env('DB_PASS', required=True)
+    DB_NAME = get_env('DB_NAME', required=True)
+    NEW_DB_NAME = get_env('NEW_DB_NAME', 'datalake_export')
+
+    db_params_src = (DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+    db_params_dest = (NEW_DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+
+    print(f"[python-runner] Connection to {DB_HOST}:{DB_PORT} as {DB_USER}. Source DB: {DB_NAME}. Dest DB: {NEW_DB_NAME}")
+
+    ready = wait_for_db(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, timeout=60, interval=2)
+    if not ready:
+        sys.exit(1)
+
+    try:
+        src_conn = connect(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+        with src_conn.cursor() as cur:
+            cur.execute("SELECT * FROM patient.patient;")
+            patients_list = list(map(itemgetter(0), cur.fetchall()))
+
+            cur.execute("select patient.propertymeasure.patient, patient.propertymeasure.value from patient.propertymeasure where patient.propertymeasure.property='Data Nascita';")
+            birthday_list = clean_birthday_rows(cur.fetchall())
+
+            cur.execute("select patient.patientevent.patient || ' ' || patient.patientevent.interval from patient.patientevent where type = 'Decesso';")
+            death_dict = clean_death_list(cur.fetchall())
+
+            cur.execute("select patient.propertymeasure.patient, patient.propertymeasure.property, patient.propertymeasure.value from patient.propertymeasure where patient.propertymeasure.property='Sesso' or patient.propertymeasure.property='Altezza' or patient.propertymeasure.property='Data Nascita' or patient.propertymeasure.property='Etnia';")
+            generality_dict = process_generality_list(cur.fetchall())
+    except Exception as e:
+        print(f"[python-runner] Source DB error: {e}")
+        sys.exit(1)
+
+    try:
+        admin_conn = connect('postgres', DB_USER, DB_PASS, DB_HOST, DB_PORT, autocommit=True)
+        with admin_conn.cursor() as cur:
+            cur.execute(sql.SQL("SELECT 1 FROM pg_database WHERE datname = %s"), [NEW_DB_NAME])
+            if cur.fetchone():
+                print(f"[python-runner] Dropping existing DB '{NEW_DB_NAME}'.")
+                cur.execute(sql.SQL("DROP DATABASE {};").format(sql.Identifier(NEW_DB_NAME)))
+            print(f"[python-runner] Creating DB '{NEW_DB_NAME}'...")
+            cur.execute(sql.SQL("CREATE DATABASE {};").format(sql.Identifier(NEW_DB_NAME)))
+    except Exception as e:
+        print(f"[python-runner] DB creation error: {e}")
+        sys.exit(1)
+
+    try:
+        dest_conn = connect(NEW_DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+        with dest_conn.cursor() as cur:
+
+            create_domains_and_tables(cur)
+            dest_conn.commit()
+
+            birthday_by_patient = {pid: dob for pid, dob in birthday_list if pid and dob}
+            birthday_rows = list(birthday_by_patient.items())
+            insert_patients(cur, birthday_rows, dest_conn, patients_list, death_dict, generality_dict)
+
+            print("[python-runner] Streaming raw measures...")
+            stream_and_insert_measures(db_params_src, dest_conn, birthday_by_patient)
+
+            print("[python-runner] Processing Dependent Properties...")
+            dependent_properties_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dependent_properties")
+            files = file_list(dependent_properties_dir)
+            
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(process_single_property_file, file, db_params_dest, birthday_by_patient) for file in files]
+                for future in futures:
+                    future.result()
+
+            print("[python-runner] Inserting into TimeVar Table...")
+            insert_timevar_table(cur, dest_conn)
+
+            cur.execute("SELECT var_name, var_id FROM TimeVar;")
+            property_tid = {row[0]: row[1] for row in cur.fetchall()}
+
+            print("[python-runner] Inserting into TimeSeries Table...")
+            insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_params_dest)
+
+            print("[python-runner] Starting NN_Training_Dataset population...")
+            insert_nn_training_dataset_table(cur, dest_conn, db_params_dest)
+
+    except Exception as e:
+        print(f"[python-runner] Destination DB error: {e}")
+        sys.exit(1)
+    finally:
+        try:
+            src_conn.close()
+            dest_conn.close()
+            admin_conn.close()
+        except Exception:
+            pass
+
+    print("[python-runner] Operation completed successfully!")
+
+if __name__ == "__main__":
+    main()
