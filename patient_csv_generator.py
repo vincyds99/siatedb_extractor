@@ -630,6 +630,9 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
                 vector = [last_values[vid] for vid in var_ids]
                 window.append(vector)
                 
+                if time_stamp.year == 2017:
+                    return
+
                 w_list = list(window)
                 w_len = len(w_list)
                 l10, l20, l30 = min(10, w_len), min(20, w_len), min(30, w_len)
@@ -638,9 +641,9 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
                 agg_30 = [sum(w[j] for w in w_list[-30:]) / l30 for j in range(num_vars)]
 
                 if date_of_death is not None:
-                    tte = max(0, (date_of_death - time_stamp).days)
+                    tte = (date_of_death - time_stamp).days
                 else:
-                    tte = max(1, (max_session_time - time_stamp).days + 1)
+                    tte = (max_session_time - time_stamp).days + 1
 
                 rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, tte))
 
