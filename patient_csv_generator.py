@@ -606,6 +606,17 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
     try:
         cursor_name = f'pat_read_{re.sub("[^a-zA-Z0-9_]", "_", clean_pid)}'
         with read_conn.cursor(name=cursor_name) as read_cur, write_conn.cursor() as write_cur:
+            from datetime import datetime
+            start_date = datetime(2023, 1, 1)
+
+            # Query the valid timestamps from Measurements for this patient
+            write_cur.execute("""
+                SELECT DISTINCT interval
+                FROM Measurements
+                WHERE patient_ID = %s;
+            """, (clean_pid,))
+            valid_timestamps = {row[0] for row in write_cur.fetchall() if row[0] >= start_date}
+
             read_cur.itersize = 2000
             
             read_cur.execute("""
@@ -625,12 +636,15 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
 
             def build_and_flush(time_stamp, vals):
                 nonlocal inserted_count
+                if time_stamp < start_date:
+                    return
+
                 for vid, v in vals.items():
                     last_values[vid] = v
                 vector = [last_values[vid] for vid in var_ids]
                 window.append(vector)
                 
-                if time_stamp.year == 2017:
+                if time_stamp not in valid_timestamps:
                     return
 
                 w_list = list(window)
@@ -641,9 +655,9 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
                 agg_30 = [sum(w[j] for w in w_list[-30:]) / l30 for j in range(num_vars)]
 
                 if date_of_death is not None:
-                    tte = (date_of_death - time_stamp).days
+                    tte = max(0, (date_of_death.date() - time_stamp.date()).days)
                 else:
-                    tte = (max_session_time - time_stamp).days + 1
+                    tte = max(1, (max_session_time.date() - time_stamp.date()).days + 1)
 
                 rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, tte))
 
@@ -704,7 +718,7 @@ def insert_nn_training_dataset_table(cur, dest_conn, db_params):
     var_defaults = {v[0]: v[2] for v in variables}
     num_vars = len(var_ids)
 
-    cur.execute("SELECT MAX(time) FROM TimeSeries;")
+    cur.execute("SELECT MAX(time) FROM TimeSeries WHERE time <= '2026-03-01 00:00:00';")
     res = cur.fetchone()
     max_session_time = res[0] if res else None
     if max_session_time is None:
