@@ -659,6 +659,9 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
                 else:
                     tte = max(1, (max_session_time.date() - time_stamp.date()).days + 1)
 
+                if tte >= 400:
+                    tte = 400
+
                 rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, tte))
 
                 if len(rows_to_insert) >= chunk_size:
@@ -743,6 +746,21 @@ def insert_nn_training_dataset_table(cur, dest_conn, db_params):
 
     print(f"[python-runner] Completed NN_Training_Dataset. Total rows inserted: {total_inserted}")
 
+def export_nn_training_dataset_csv(cur):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    nn_dir = os.path.join(script_dir, "NN_Dataset")
+    os.makedirs(nn_dir, exist_ok=True)
+    
+    file_path = os.path.join(nn_dir, "NN_training_dataset.csv")
+    if os.path.exists(file_path):
+        print(f"[python-runner] Removing existing CSV file: {file_path}")
+        os.remove(file_path)
+
+    print(f"[python-runner] Exporting NN_Training_Dataset table to {file_path}...")
+    with open(file_path, "w", encoding="utf-8", newline="") as f:
+        cur.copy_expert("COPY NN_Training_Dataset TO STDOUT WITH CSV HEADER;", f)
+    print(f"[python-runner] Export completed successfully to {file_path}!")
+
 def main():
     DB_HOST = get_env('DB_HOST', 'datalake_backend_db')
     DB_PORT = get_env('DB_PORT', '5432')
@@ -826,6 +844,9 @@ def main():
 
             print("[python-runner] Starting NN_Training_Dataset population...")
             insert_nn_training_dataset_table(cur, dest_conn, db_params_dest)
+
+            print("[python-runner] Exporting NN_Training_Dataset to CSV...")
+            export_nn_training_dataset_csv(cur)
 
     except Exception as e:
         print(f"[python-runner] Destination DB error: {e}")
