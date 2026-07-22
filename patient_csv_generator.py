@@ -504,7 +504,7 @@ def insert_timevar_table(cur, dest_conn):
 def insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_params):
     batch = []
     batch_size = 5000 
-    print("[python-runner] Inserting Raw Measurements into TimeSeries (FILTERED)...")
+    print("[python-runner] Inserting Raw Measurements into TimeSeries...")
     dbname, user, password, host, port = db_params
     read_conn = connect(dbname, user, password, host, port)
     
@@ -514,9 +514,6 @@ def insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_par
             read_cur.execute("SELECT patient_ID, interval, property, value FROM Measurements;")
             
             for patient_id, interval, property, value in read_cur:
-                if property not in ALLOWED_NN_PROPS:
-                    continue
-
                 clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
                 if clean_pid not in birthday_by_patient:
                     continue
@@ -551,15 +548,12 @@ def insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_par
                 dest_conn.commit()
                 batch.clear()
 
-        print("[python-runner] Inserting Dependent Properties into TimeSeries (FILTERED)...")
+        print("[python-runner] Inserting Dependent Properties into TimeSeries...")
         with read_conn.cursor(name='dep_props_reader') as read_cur, dest_conn.cursor() as write_cur:
             read_cur.itersize = batch_size
             read_cur.execute("SELECT patient_ID, interval, property, value FROM DependentProperties;")
             
             for patient_id, interval, property, value in read_cur:
-                if property not in ALLOWED_NN_PROPS:
-                    continue
-
                 clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
                 if clean_pid not in birthday_by_patient:
                     continue
@@ -708,13 +702,12 @@ def insert_nn_training_dataset_table(cur, dest_conn, db_params):
     cur.execute("""
         SELECT var_id, var_name, average 
         FROM TimeVar 
-        WHERE var_name IN %s 
         ORDER BY var_id;
-    """, (tuple(ALLOWED_NN_PROPS),))
+    """)
     
     variables = cur.fetchall()
     if not variables:
-        print("[python-runner] No variables found in TimeVar matching ALLOWED_NN_PROPS. Skipping.")
+        print("[python-runner] No variables found in TimeVar. Skipping.")
         return
 
     var_ids = [v[0] for v in variables]
