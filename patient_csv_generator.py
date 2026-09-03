@@ -6,6 +6,7 @@ import re
 import psycopg2
 import csv
 import gc
+import math
 from pathlib import Path
 from psycopg2 import sql
 from operator import itemgetter
@@ -14,14 +15,22 @@ from psycopg2.extras import execute_values
 
 # Define the list of allowed features for the neural network (request of the professor)
 ALLOWED_NN_PROPS = {
-    # Raw properties
+    # Raw properties (15)
     "Arter", "Azotemia Post", "Azotemia Pre", "BCM post", "BMI", 
     "FFM post", "FM post", "Peso Post", "Peso Pre", "QB Medio", 
     "QB Totale", "Score CVC", "Score FAV", "Tipo Accesso Vascolare", 
     "Vena", "Vitamina D",
-    # Dependent properties
+    # Dependent properties (11)
     "A/V", "Mesi CVC", "Mesi FAV", "Minuti Dialisi", "Ore Dialisi", 
     "PA/QB", "PV/QB", "QB", "TSAT", "UF", "UF Tot"
+}
+
+# Vascular access features subset (12 properties)
+VASCULAR_ACCESS_PROPS = {
+    # Raw properties (6)
+    "Arter", "Vena", "Score CVC", "Score FAV", "QB Medio", "QB Totale",
+    # Dependent properties (6)
+    "A/V", "Mesi CVC", "Mesi FAV", "PA/QB", "PV/QB", "QB"
 }
 
 # get environment variable with optional default and required flag
@@ -223,6 +232,7 @@ def create_domains_and_tables(cur):
                     patient_id String4PatientId PRIMARY KEY,     
                     date_of_birth timestamp NOT NULL,
                     date_of_death timestamp,                      
+                    date_of_critical_event timestamp,
                     gender GenderType,
                     ethnicity Ethnicity,
                     height REAL
@@ -277,12 +287,15 @@ def create_domains_and_tables(cur):
         aggregati_20 DOUBLE PRECISION[] NOT NULL,
         aggregati_30 DOUBLE PRECISION[] NOT NULL,
         tte INTEGER NOT NULL,
+        log_tte DOUBLE PRECISION NOT NULL,
+        tte_uncapped INTEGER NOT NULL,
+        log_tte_uncapped DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (timestamp, patient_id),
         CONSTRAINT patient_ref FOREIGN KEY(patient_id) REFERENCES Patient(patient_id)
     );""")
 
 # insert patients
-def insert_patients(cur, birthday_rows, dest_conn, patients_list, death_dict, generality_dict):
+def insert_patients(cur, birthday_rows, dest_conn, patients_list, death_dict, generality_dict, critical_event_dict):
     query = """
                 INSERT INTO Patient (patient_id, date_of_birth)
                 VALUES (%s, %s)
@@ -301,24 +314,33 @@ def insert_patients(cur, birthday_rows, dest_conn, patients_list, death_dict, ge
         dest_conn.commit()
 
     for patient_id in patients_list:
-        if patient_id in death_dict:
-            death_date = death_dict[patient_id]
+        clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
+        if clean_pid in death_dict:
+            death_date = death_dict[clean_pid]
             cur.execute("""
                 UPDATE Patient
                 SET date_of_death = %s
                 WHERE patient_id = %s;
-            """, (death_date, patient_id))
+            """, (death_date, clean_pid))
             dest_conn.commit()
-        if patient_id in generality_dict:
-            gender = normalize_gender(generality_dict[patient_id][1])
-            height = generality_dict[patient_id][2]
-            ethnicity = normalize_ethnicity(generality_dict[patient_id][3])
+        if clean_pid in critical_event_dict:
+            crit_date = critical_event_dict[clean_pid]
+            cur.execute("""
+                UPDATE Patient
+                SET date_of_critical_event = %s
+                WHERE patient_id = %s;
+            """, (crit_date, clean_pid))
+            dest_conn.commit()
+        if clean_pid in generality_dict:
+            gender = normalize_gender(generality_dict[clean_pid][1])
+            height = generality_dict[clean_pid][2]
+            ethnicity = normalize_ethnicity(generality_dict[clean_pid][3])
 
             cur.execute("""
                 UPDATE Patient
                 SET gender = %s, height = %s, ethnicity = %s
                 WHERE patient_id = %s;
-            """, (gender, height, ethnicity, patient_id))
+            """, (gender, height, ethnicity, clean_pid))
             dest_conn.commit()
 
 def stream_and_insert_measures(db_params_src, dest_conn, birthday_by_patient):
@@ -589,7 +611,7 @@ def insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_par
     finally:
         read_conn.close()
 
-def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, num_vars, max_session_time, db_params):
+def process_patient_optimized(patient_id, date_of_critical_event, var_ids, var_defaults, num_vars, max_session_time, db_params):
     dbname, user, password, host, port = db_params
     read_conn = connect(dbname, user, password, host, port)
     write_conn = connect(dbname, user, password, host, port)
@@ -603,13 +625,18 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
             from datetime import datetime
             start_date = datetime(2023, 1, 1)
 
-            # Query the valid timestamps from Measurements for this patient
+            # Query valid session timestamps from Measurements for this patient
             write_cur.execute("""
                 SELECT DISTINCT interval
                 FROM Measurements
                 WHERE patient_ID = %s;
             """, (clean_pid,))
             valid_timestamps = {row[0] for row in write_cur.fetchall() if row[0] >= start_date}
+
+            if not valid_timestamps:
+                return 0
+
+            patient_last_session = max(valid_timestamps)
 
             read_cur.itersize = 2000
             
@@ -641,6 +668,26 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
                 if time_stamp not in valid_timestamps:
                     return
 
+                # --- CRITICAL EVENT & CENSORING (Horizon = 360 days) ---
+                if date_of_critical_event is not None:
+                    # If session occurs after the first critical event, ignore it (event already occurred)
+                    if time_stamp.date() > date_of_critical_event.date():
+                        return
+                    delta = (date_of_critical_event.date() - time_stamp.date()).days
+                    tte_uncapped = max(1, delta)
+                    tte_capped = min(360, tte_uncapped)
+                else:
+                    # Patient has no critical event
+                    residual_days = (patient_last_session.date() - time_stamp.date()).days
+                    # Censoring filter: discard session if no event occurs within 360 days and residual window is < 360 days
+                    if residual_days < 360:
+                        return
+                    tte_capped = 360
+                    tte_uncapped = max(360, (max_session_time.date() - time_stamp.date()).days + 1)
+
+                log_tte_capped = round(math.log(tte_capped), 6)
+                log_tte_uncapped = round(math.log(tte_uncapped), 6)
+
                 w_list = list(window)
                 w_len = len(w_list)
                 l10, l20, l30 = min(10, w_len), min(20, w_len), min(30, w_len)
@@ -648,19 +695,13 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
                 agg_20 = [sum(w[j] for w in w_list[-20:]) / l20 for j in range(num_vars)]
                 agg_30 = [sum(w[j] for w in w_list[-30:]) / l30 for j in range(num_vars)]
 
-                if date_of_death is not None:
-                    tte = max(0, (date_of_death.date() - time_stamp.date()).days)
-                else:
-                    tte = max(1, (max_session_time.date() - time_stamp.date()).days + 1)
-
-                if tte >= 400:
-                    tte = 400
-
-                rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, tte))
+                rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, 
+                                       tte_capped, log_tte_capped, tte_uncapped, log_tte_uncapped))
 
                 if len(rows_to_insert) >= chunk_size:
                     execute_values(write_cur, """
-                        INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, tte)
+                        INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, 
+                                                         tte, log_tte, tte_uncapped, log_tte_uncapped)
                         VALUES %s
                         ON CONFLICT (timestamp, patient_id) DO NOTHING;
                     """, rows_to_insert)
@@ -681,7 +722,8 @@ def process_patient_optimized(patient_id, date_of_death, var_ids, var_defaults, 
 
             if rows_to_insert:
                 execute_values(write_cur, """
-                    INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, tte)
+                    INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, 
+                                                     tte, log_tte, tte_uncapped, log_tte_uncapped)
                     VALUES %s
                     ON CONFLICT (timestamp, patient_id) DO NOTHING;
                 """, rows_to_insert)
@@ -721,15 +763,15 @@ def insert_nn_training_dataset_table(cur, dest_conn, db_params):
         print("[python-runner] No sessions found in TimeSeries. Skipping.")
         return
 
-    cur.execute("SELECT patient_id, date_of_death FROM Patient;")
+    cur.execute("SELECT patient_id, date_of_critical_event FROM Patient;")
     patients = cur.fetchall()
 
-    print(f"[python-runner] Starting NN processing for {len(patients)} patients with {num_vars} aggregated features...")
+    print(f"[python-runner] Starting NN processing for {len(patients)} patients with {num_vars} features (first critical event + 360d censoring)...")
 
     total_inserted = 0
-    for i, (patient_id, date_of_death) in enumerate(patients, 1):
+    for i, (patient_id, date_of_critical_event) in enumerate(patients, 1):
         inserted = process_patient_optimized(
-            patient_id, date_of_death, var_ids, var_defaults, num_vars, max_session_time, db_params
+            patient_id, date_of_critical_event, var_ids, var_defaults, num_vars, max_session_time, db_params
         )
         total_inserted += inserted
         
@@ -739,20 +781,95 @@ def insert_nn_training_dataset_table(cur, dest_conn, db_params):
 
     print(f"[python-runner] Completed NN_Training_Dataset. Total rows inserted: {total_inserted}")
 
-def export_nn_training_dataset_csv(cur):
+def export_nn_training_datasets(cur, dest_conn):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     nn_dir = os.path.join(script_dir, "NN_Dataset")
     os.makedirs(nn_dir, exist_ok=True)
-    
-    file_path = os.path.join(nn_dir, "NN_training_dataset.csv")
-    if os.path.exists(file_path):
-        print(f"[python-runner] Removing existing CSV file: {file_path}")
-        os.remove(file_path)
 
-    print(f"[python-runner] Exporting NN_Training_Dataset table to {file_path}...")
-    with open(file_path, "w", encoding="utf-8", newline="") as f:
-        cur.copy_expert("COPY NN_Training_Dataset TO STDOUT WITH CSV HEADER;", f)
-    print(f"[python-runner] Export completed successfully to {file_path}!")
+    cur.execute("SELECT var_id, var_name FROM TimeVar ORDER BY var_id;")
+    var_rows = cur.fetchall()
+    var_names = [r[1] for r in var_rows]
+
+    idx_44 = list(range(len(var_names)))
+    idx_26 = [i for i, name in enumerate(var_names) if name in ALLOWED_NN_PROPS]
+    idx_av = [i for i, name in enumerate(var_names) if name in VASCULAR_ACCESS_PROPS]
+
+    print(f"[python-runner] Features mapping: {len(idx_44)} all clinical, {len(idx_26)} standard allowed (26), {len(idx_av)} vascular access only (12).")
+
+    # Defined output files (the 3 requested datasets)
+    files_info = [
+        ("NN_training_dataset_26_uncapped.csv", idx_26, "uncapped"),
+        ("NN_training_dataset_26_capped360.csv", idx_26, "capped"),
+        ("NN_training_dataset_44_capped360.csv", idx_44, "capped"),
+    ]
+
+    open_files = []
+    writers = []
+    header = ["timestamp", "patient_id", "misure", "aggregati_10", "aggregati_20", "aggregati_30", "tte", "log_tte"]
+
+    for filename, _, _ in files_info:
+        file_path = os.path.join(nn_dir, filename)
+        if os.path.exists(file_path):
+            print(f"[python-runner] Removing existing CSV file: {file_path}")
+            os.remove(file_path)
+        f = open(file_path, "w", encoding="utf-8", newline="")
+        writer = csv.writer(f)
+        writer.writerow(header)
+        open_files.append(f)
+        writers.append(writer)
+
+    print(f"[python-runner] Streaming and generating CSV datasets in {nn_dir}...")
+    with dest_conn.cursor(name='export_stream_cursor') as stream_cur:
+        stream_cur.itersize = 5000
+        stream_cur.execute("""
+            SELECT timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, 
+                   tte, log_tte, tte_uncapped, log_tte_uncapped 
+            FROM NN_Training_Dataset 
+            ORDER BY patient_id, timestamp;
+        """)
+
+        count = 0
+        for row in stream_cur:
+            ts, pid, m, a10, a20, a30, tte_c, log_c, tte_u, log_u = row
+            clean_pid = pid.strip() if isinstance(pid, str) else pid
+
+            m_44 = "{" + ",".join(str(m[i]) for i in idx_44) + "}"
+            a10_44 = "{" + ",".join(str(a10[i]) for i in idx_44) + "}"
+            a20_44 = "{" + ",".join(str(a20[i]) for i in idx_44) + "}"
+            a30_44 = "{" + ",".join(str(a30[i]) for i in idx_44) + "}"
+
+            m_26 = "{" + ",".join(str(m[i]) for i in idx_26) + "}"
+            a10_26 = "{" + ",".join(str(a10[i]) for i in idx_26) + "}"
+            a20_26 = "{" + ",".join(str(a20[i]) for i in idx_26) + "}"
+            a30_26 = "{" + ",".join(str(a30[i]) for i in idx_26) + "}"
+
+            m_av = "{" + ",".join(str(m[i]) for i in idx_av) + "}"
+            a10_av = "{" + ",".join(str(a10[i]) for i in idx_av) + "}"
+            a20_av = "{" + ",".join(str(a20[i]) for i in idx_av) + "}"
+            a30_av = "{" + ",".join(str(a30[i]) for i in idx_av) + "}"
+
+            for idx_f, (fname, feat_indices, mode) in enumerate(files_info):
+                w = writers[idx_f]
+                if feat_indices is idx_26:
+                    fm, fa10, fa20, fa30 = m_26, a10_26, a20_26, a30_26
+                elif feat_indices is idx_44:
+                    fm, fa10, fa20, fa30 = m_44, a10_44, a20_44, a30_44
+                else:
+                    fm, fa10, fa20, fa30 = m_av, a10_av, a20_av, a30_av
+
+                if mode == "uncapped":
+                    w.writerow([ts, clean_pid, fm, fa10, fa20, fa30, tte_u, log_u])
+                else:
+                    w.writerow([ts, clean_pid, fm, fa10, fa20, fa30, tte_c, log_c])
+
+            count += 1
+            if count % 50000 == 0:
+                print(f"[python-runner] Exported {count} rows across all CSV files...")
+
+    for f in open_files:
+        f.close()
+
+    print(f"[python-runner] Successfully exported {count} rows to all {len(files_info)} dataset files in {nn_dir}!")
 
 def main():
     DB_HOST = get_env('DB_HOST', 'datalake_backend_db')
@@ -783,6 +900,18 @@ def main():
             cur.execute("select patient.patientevent.patient || ' ' || patient.patientevent.interval from patient.patientevent where type = 'Decesso';")
             death_dict = clean_death_list(cur.fetchall())
 
+            # Extract the FIRST critical event in absolute for each patient (hospitalizations, vascular access events, death)
+            cur.execute("""
+                SELECT patient, min(lower(interval))
+                FROM patient.patientevent
+                WHERE type != 'Seduta Dialisi'
+                GROUP BY patient;
+            """)
+            critical_event_dict = {
+                (row[0].strip() if isinstance(row[0], str) else row[0]): row[1]
+                for row in cur.fetchall() if row[0] and row[1]
+            }
+
             cur.execute("select patient.propertymeasure.patient, patient.propertymeasure.property, patient.propertymeasure.value from patient.propertymeasure where patient.propertymeasure.property='Sesso' or patient.propertymeasure.property='Altezza' or patient.propertymeasure.property='Data Nascita' or patient.propertymeasure.property='Etnia';")
             generality_dict = process_generality_list(cur.fetchall())
     except Exception as e:
@@ -811,7 +940,7 @@ def main():
 
             birthday_by_patient = {pid: dob for pid, dob in birthday_list if pid and dob}
             birthday_rows = list(birthday_by_patient.items())
-            insert_patients(cur, birthday_rows, dest_conn, patients_list, death_dict, generality_dict)
+            insert_patients(cur, birthday_rows, dest_conn, patients_list, death_dict, generality_dict, critical_event_dict)
 
             print("[python-runner] Streaming raw measures...")
             stream_and_insert_measures(db_params_src, dest_conn, birthday_by_patient)
@@ -838,8 +967,8 @@ def main():
             print("[python-runner] Starting NN_Training_Dataset population...")
             insert_nn_training_dataset_table(cur, dest_conn, db_params_dest)
 
-            print("[python-runner] Exporting NN_Training_Dataset to CSV...")
-            export_nn_training_dataset_csv(cur)
+            print("[python-runner] Exporting NN datasets to CSV files in NN_Dataset/...")
+            export_nn_training_datasets(cur, dest_conn)
 
     except Exception as e:
         print(f"[python-runner] Destination DB error: {e}")

@@ -13,6 +13,7 @@ CREATE TABLE Patient (
     patient_id String4PatientId PRIMARY KEY,     
     date_of_birth timestamp NOT NULL,
     date_of_death timestamp,                      
+    date_of_critical_event timestamp,             -- first critical event in absolute (hospitalizations, vascular complications, death)
     gender GenderType,
     ethnicity Ethnicity,
     height REAL                                  -- NOTE: we don't have height for all patients
@@ -75,7 +76,10 @@ CREATE TABLE NN_Training_Dataset (
     aggregati_10 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 10 sessions
     aggregati_20 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 20 sessions
     aggregati_30 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 30 sessions
-    tte INTEGER NOT NULL,                     -- Time To Event in giorni (TTE)
+    tte INTEGER NOT NULL,                     -- Time To Event in days (capped at 360)
+    log_tte DOUBLE PRECISION NOT NULL,        -- log(TTE) capped
+    tte_uncapped INTEGER NOT NULL,            -- Time To Event in days (uncapped)
+    log_tte_uncapped DOUBLE PRECISION NOT NULL,-- log(TTE) uncapped
     
     PRIMARY KEY (timestamp, patient_id),
     CONSTRAINT patient_ref FOREIGN KEY(patient_id) REFERENCES Patient(patient_id)
