@@ -13,7 +13,7 @@ CREATE TABLE Patient (
     patient_id String4PatientId PRIMARY KEY,     
     date_of_birth timestamp NOT NULL,
     date_of_death timestamp,                      
-    date_of_critical_event timestamp,             -- first critical event in absolute (hospitalizations, vascular complications, death)
+    date_of_critical_event timestamp,             -- first critical event subsequent to the first session (hospitalizations, vascular complications, death)
     gender GenderType,
     ethnicity Ethnicity,
     height REAL                                  -- NOTE: we don't have height for all patients

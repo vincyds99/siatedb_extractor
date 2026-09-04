@@ -611,7 +611,7 @@ def insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_par
     finally:
         read_conn.close()
 
-def process_patient_optimized(patient_id, date_of_critical_event, var_ids, var_defaults, num_vars, max_session_time, db_params):
+def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defaults, num_vars, max_session_time, db_params):
     dbname, user, password, host, port = db_params
     read_conn = connect(dbname, user, password, host, port)
     write_conn = connect(dbname, user, password, host, port)
@@ -668,16 +668,20 @@ def process_patient_optimized(patient_id, date_of_critical_event, var_ids, var_d
                 if time_stamp not in valid_timestamps:
                     return
 
+                # Sliding window requirement: only consider sessions with at least 30 past sessions in history
+                if len(window) < 30:
+                    return
+
                 # --- CRITICAL EVENT & CENSORING (Horizon = 360 days) ---
-                if date_of_critical_event is not None:
-                    # If session occurs after the first critical event, ignore it (event already occurred)
-                    if time_stamp.date() > date_of_critical_event.date():
-                        return
-                    delta = (date_of_critical_event.date() - time_stamp.date()).days
-                    tte_uncapped = max(1, delta)
+                # Find the first critical event strictly in the future of this session
+                next_critical_event = next((ev for ev in pat_critical_events if ev.date() > time_stamp.date()), None)
+
+                if next_critical_event is not None:
+                    delta = (next_critical_event.date() - time_stamp.date()).days
+                    tte_uncapped = delta
                     tte_capped = min(360, tte_uncapped)
                 else:
-                    # Patient has no critical event
+                    # Patient has no critical event after this session
                     residual_days = (patient_last_session.date() - time_stamp.date()).days
                     # Censoring filter: discard session if no event occurs within 360 days and residual window is < 360 days
                     if residual_days < 360:
@@ -689,11 +693,9 @@ def process_patient_optimized(patient_id, date_of_critical_event, var_ids, var_d
                 log_tte_uncapped = round(math.log(tte_uncapped), 6)
 
                 w_list = list(window)
-                w_len = len(w_list)
-                l10, l20, l30 = min(10, w_len), min(20, w_len), min(30, w_len)
-                agg_10 = [sum(w[j] for w in w_list[-10:]) / l10 for j in range(num_vars)]
-                agg_20 = [sum(w[j] for w in w_list[-20:]) / l20 for j in range(num_vars)]
-                agg_30 = [sum(w[j] for w in w_list[-30:]) / l30 for j in range(num_vars)]
+                agg_10 = [sum(w[j] for w in w_list[-10:]) / 10.0 for j in range(num_vars)]
+                agg_20 = [sum(w[j] for w in w_list[-20:]) / 20.0 for j in range(num_vars)]
+                agg_30 = [sum(w[j] for w in w_list[-30:]) / 30.0 for j in range(num_vars)]
 
                 rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, 
                                        tte_capped, log_tte_capped, tte_uncapped, log_tte_uncapped))
@@ -740,7 +742,7 @@ def process_patient_optimized(patient_id, date_of_critical_event, var_ids, var_d
         read_conn.close()
         write_conn.close()
 
-def insert_nn_training_dataset_table(cur, dest_conn, db_params):
+def insert_nn_training_dataset_table(cur, dest_conn, db_params, critical_events_by_patient):
     cur.execute("""
         SELECT var_id, var_name, average 
         FROM TimeVar 
@@ -763,15 +765,17 @@ def insert_nn_training_dataset_table(cur, dest_conn, db_params):
         print("[python-runner] No sessions found in TimeSeries. Skipping.")
         return
 
-    cur.execute("SELECT patient_id, date_of_critical_event FROM Patient;")
-    patients = cur.fetchall()
+    cur.execute("SELECT patient_id FROM Patient;")
+    patients = [r[0] for r in cur.fetchall()]
 
-    print(f"[python-runner] Starting NN processing for {len(patients)} patients with {num_vars} features (first critical event + 360d censoring)...")
+    print(f"[python-runner] Starting NN processing for {len(patients)} patients with {num_vars} features (sliding window >= 30, subsequent critical events, 360d censoring)...")
 
     total_inserted = 0
-    for i, (patient_id, date_of_critical_event) in enumerate(patients, 1):
+    for i, patient_id in enumerate(patients, 1):
+        clean_pid = patient_id.strip() if isinstance(patient_id, str) else patient_id
+        pat_events = critical_events_by_patient.get(clean_pid, [])
         inserted = process_patient_optimized(
-            patient_id, date_of_critical_event, var_ids, var_defaults, num_vars, max_session_time, db_params
+            clean_pid, pat_events, var_ids, var_defaults, num_vars, max_session_time, db_params
         )
         total_inserted += inserted
         
@@ -900,16 +904,29 @@ def main():
             cur.execute("select patient.patientevent.patient || ' ' || patient.patientevent.interval from patient.patientevent where type = 'Decesso';")
             death_dict = clean_death_list(cur.fetchall())
 
-            # Extract the FIRST critical event in absolute for each patient (hospitalizations, vascular access events, death)
+            # Extract all critical events strictly subsequent to each patient's first dialysis session (>= 2023)
             cur.execute("""
-                SELECT patient, min(lower(interval))
-                FROM patient.patientevent
-                WHERE type != 'Seduta Dialisi'
-                GROUP BY patient;
+                WITH first_session AS (
+                    SELECT patient, min(lower(interval)) as first_sess
+                    FROM patient.propertymeasure
+                    WHERE lower(interval) >= '2023-01-01'
+                    GROUP BY patient
+                )
+                SELECT e.patient, lower(e.interval)
+                FROM patient.patientevent e
+                JOIN first_session s ON e.patient = s.patient
+                WHERE e.type != 'Seduta Dialisi'
+                  AND lower(e.interval)::date > s.first_sess::date
+                ORDER BY e.patient, lower(e.interval);
             """)
+            critical_events_by_patient = defaultdict(list)
+            for row in cur.fetchall():
+                p_id = row[0].strip() if isinstance(row[0], str) else row[0]
+                critical_events_by_patient[p_id].append(row[1])
+
+            # For Patient table date_of_critical_event column, store the first critical event subsequent to the first session
             critical_event_dict = {
-                (row[0].strip() if isinstance(row[0], str) else row[0]): row[1]
-                for row in cur.fetchall() if row[0] and row[1]
+                pid: ev_list[0] for pid, ev_list in critical_events_by_patient.items() if ev_list
             }
 
             cur.execute("select patient.propertymeasure.patient, patient.propertymeasure.property, patient.propertymeasure.value from patient.propertymeasure where patient.propertymeasure.property='Sesso' or patient.propertymeasure.property='Altezza' or patient.propertymeasure.property='Data Nascita' or patient.propertymeasure.property='Etnia';")
@@ -965,7 +982,7 @@ def main():
             insert_timeseries_table(dest_conn, birthday_by_patient, property_tid, db_params_dest)
 
             print("[python-runner] Starting NN_Training_Dataset population...")
-            insert_nn_training_dataset_table(cur, dest_conn, db_params_dest)
+            insert_nn_training_dataset_table(cur, dest_conn, db_params_dest, critical_events_by_patient)
 
             print("[python-runner] Exporting NN datasets to CSV files in NN_Dataset/...")
             export_nn_training_datasets(cur, dest_conn)
