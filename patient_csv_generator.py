@@ -282,6 +282,7 @@ def create_domains_and_tables(cur):
     cur.execute("""CREATE TABLE NN_Training_Dataset (
         timestamp timestamp NOT NULL,
         patient_id String4PatientId NOT NULL,
+        history_days INTEGER NOT NULL,
         misure DOUBLE PRECISION[] NOT NULL,
         aggregati_10 DOUBLE PRECISION[] NOT NULL,
         aggregati_20 DOUBLE PRECISION[] NOT NULL,
@@ -636,6 +637,7 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
             if not valid_timestamps:
                 return 0
 
+            patient_first_session = min(valid_timestamps)
             patient_last_session = max(valid_timestamps)
 
             read_cur.itersize = 2000
@@ -668,8 +670,9 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
                 if time_stamp not in valid_timestamps:
                     return
 
-                # Sliding window requirement: only consider sessions with at least 30 past sessions in history
-                if len(window) < 30:
+                # Inclusion criterion: session must have at least W=30 days of history from patient's first session
+                history_days = (time_stamp.date() - patient_first_session.date()).days
+                if history_days < 30:
                     return
 
                 # --- CRITICAL EVENT & CENSORING (Horizon = 360 days) ---
@@ -693,16 +696,18 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
                 log_tte_uncapped = round(math.log(tte_uncapped), 6)
 
                 w_list = list(window)
-                agg_10 = [sum(w[j] for w in w_list[-10:]) / 10.0 for j in range(num_vars)]
-                agg_20 = [sum(w[j] for w in w_list[-20:]) / 20.0 for j in range(num_vars)]
-                agg_30 = [sum(w[j] for w in w_list[-30:]) / 30.0 for j in range(num_vars)]
+                w_len = len(w_list)
+                l10, l20, l30 = min(10, w_len), min(20, w_len), min(30, w_len)
+                agg_10 = [sum(w[j] for w in w_list[-10:]) / l10 for j in range(num_vars)]
+                agg_20 = [sum(w[j] for w in w_list[-20:]) / l20 for j in range(num_vars)]
+                agg_30 = [sum(w[j] for w in w_list[-30:]) / l30 for j in range(num_vars)]
 
-                rows_to_insert.append((time_stamp, clean_pid, vector, agg_10, agg_20, agg_30, 
+                rows_to_insert.append((time_stamp, clean_pid, history_days, vector, agg_10, agg_20, agg_30, 
                                        tte_capped, log_tte_capped, tte_uncapped, log_tte_uncapped))
 
                 if len(rows_to_insert) >= chunk_size:
                     execute_values(write_cur, """
-                        INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, 
+                        INSERT INTO NN_Training_Dataset (timestamp, patient_id, history_days, misure, aggregati_10, aggregati_20, aggregati_30, 
                                                          tte, log_tte, tte_uncapped, log_tte_uncapped)
                         VALUES %s
                         ON CONFLICT (timestamp, patient_id) DO NOTHING;
@@ -724,7 +729,7 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
 
             if rows_to_insert:
                 execute_values(write_cur, """
-                    INSERT INTO NN_Training_Dataset (timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, 
+                    INSERT INTO NN_Training_Dataset (timestamp, patient_id, history_days, misure, aggregati_10, aggregati_20, aggregati_30, 
                                                      tte, log_tte, tte_uncapped, log_tte_uncapped)
                     VALUES %s
                     ON CONFLICT (timestamp, patient_id) DO NOTHING;
@@ -800,18 +805,27 @@ def export_nn_training_datasets(cur, dest_conn):
 
     print(f"[python-runner] Features mapping: {len(idx_44)} all clinical, {len(idx_26)} standard allowed (26), {len(idx_av)} vascular access only (12).")
 
-    # Defined output files (the 3 requested datasets)
+    # Defined output files: 6 datasets (W=30 and W=60) + standard default aliases (W=30)
     files_info = [
-        ("NN_training_dataset_26_uncapped.csv", idx_26, "uncapped"),
-        ("NN_training_dataset_26_capped360.csv", idx_26, "capped"),
-        ("NN_training_dataset_44_capped360.csv", idx_44, "capped"),
+        # W = 30 days
+        ("NN_training_dataset_W30_26_uncapped.csv", idx_26, "uncapped", 30),
+        ("NN_training_dataset_W30_26_capped360.csv", idx_26, "capped", 30),
+        ("NN_training_dataset_W30_44_capped360.csv", idx_44, "capped", 30),
+        # W = 60 days
+        ("NN_training_dataset_W60_26_uncapped.csv", idx_26, "uncapped", 60),
+        ("NN_training_dataset_W60_26_capped360.csv", idx_26, "capped", 60),
+        ("NN_training_dataset_W60_44_capped360.csv", idx_44, "capped", 60),
+        # Default aliases (W = 30)
+        ("NN_training_dataset_26_uncapped.csv", idx_26, "uncapped", 30),
+        ("NN_training_dataset_26_capped360.csv", idx_26, "capped", 30),
+        ("NN_training_dataset_44_capped360.csv", idx_44, "capped", 30),
     ]
 
     open_files = []
     writers = []
     header = ["timestamp", "patient_id", "misure", "aggregati_10", "aggregati_20", "aggregati_30", "tte", "log_tte"]
 
-    for filename, _, _ in files_info:
+    for filename, _, _, _ in files_info:
         file_path = os.path.join(nn_dir, filename)
         if os.path.exists(file_path):
             print(f"[python-runner] Removing existing CSV file: {file_path}")
@@ -826,15 +840,16 @@ def export_nn_training_datasets(cur, dest_conn):
     with dest_conn.cursor(name='export_stream_cursor') as stream_cur:
         stream_cur.itersize = 5000
         stream_cur.execute("""
-            SELECT timestamp, patient_id, misure, aggregati_10, aggregati_20, aggregati_30, 
+            SELECT timestamp, patient_id, history_days, misure, aggregati_10, aggregati_20, aggregati_30, 
                    tte, log_tte, tte_uncapped, log_tte_uncapped 
             FROM NN_Training_Dataset 
             ORDER BY patient_id, timestamp;
         """)
 
         count = 0
+        file_counts = [0] * len(files_info)
         for row in stream_cur:
-            ts, pid, m, a10, a20, a30, tte_c, log_c, tte_u, log_u = row
+            ts, pid, h_days, m, a10, a20, a30, tte_c, log_c, tte_u, log_u = row
             clean_pid = pid.strip() if isinstance(pid, str) else pid
 
             m_44 = "{" + ",".join(str(m[i]) for i in idx_44) + "}"
@@ -852,7 +867,10 @@ def export_nn_training_datasets(cur, dest_conn):
             a20_av = "{" + ",".join(str(a20[i]) for i in idx_av) + "}"
             a30_av = "{" + ",".join(str(a30[i]) for i in idx_av) + "}"
 
-            for idx_f, (fname, feat_indices, mode) in enumerate(files_info):
+            for idx_f, (fname, feat_indices, mode, min_w) in enumerate(files_info):
+                if h_days < min_w:
+                    continue
+
                 w = writers[idx_f]
                 if feat_indices is idx_26:
                     fm, fa10, fa20, fa30 = m_26, a10_26, a20_26, a30_26
@@ -866,14 +884,19 @@ def export_nn_training_datasets(cur, dest_conn):
                 else:
                     w.writerow([ts, clean_pid, fm, fa10, fa20, fa30, tte_c, log_c])
 
+                file_counts[idx_f] += 1
+
             count += 1
             if count % 50000 == 0:
-                print(f"[python-runner] Exported {count} rows across all CSV files...")
+                print(f"[python-runner] Streamed {count} source rows...")
 
     for f in open_files:
         f.close()
 
-    print(f"[python-runner] Successfully exported {count} rows to all {len(files_info)} dataset files in {nn_dir}!")
+    for idx_f, (fname, _, _, _) in enumerate(files_info):
+        print(f"[python-runner] File '{fname}': {file_counts[idx_f]} rows written.")
+
+    print(f"[python-runner] Successfully exported all {len(files_info)} dataset files in {nn_dir}!")
 
 def main():
     DB_HOST = get_env('DB_HOST', 'datalake_backend_db')

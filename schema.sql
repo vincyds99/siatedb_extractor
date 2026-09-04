@@ -72,6 +72,7 @@ CREATE INDEX idx_timeseries_pid ON TimeSeries (pid);
 CREATE TABLE NN_Training_Dataset (
     timestamp timestamp NOT NULL,
     patient_id String4PatientId NOT NULL,
+    history_days INTEGER NOT NULL,            -- days since patient's first dialysis session (>= 30)
     misure DOUBLE PRECISION[] NOT NULL,       -- array of misure (raw measurements) for the patient at the given timestamp
     aggregati_10 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 10 sessions
     aggregati_20 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 20 sessions
