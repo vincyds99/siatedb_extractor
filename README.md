@@ -15,7 +15,7 @@ The generator (`patient_csv_generator.py`) runs an end-to-end pipeline that:
    - `TimeVar`: metadata and statistics per variable (bounds, mean, standard deviation).
    - `TimeSeries`: indexed time series organized by patient, timestamp, and variable.
    - `NN_Training_Dataset`: structured dataset for training neural network models.
-3. Exports final CSV files into the `NN_Dataset/` directory.
+3. Exports final CSV files and `patient_age.json` into the `NN_Dataset/` directory.
 
 ---
 
@@ -104,6 +104,17 @@ timestamp,patient_id,misure,aggregati_10,aggregati_20,aggregati_30,tte,log_tte
 - `tte`: Time-To-Event in days.
 - `log_tte`: natural logarithm of the Time-To-Event ($\ln(\text{TTE})$).
 
+### Patient Age Mapping (`patient_age.json`)
+In addition to the CSV datasets, the pipeline exports `patient_age.json` containing a dictionary mapping each patient ID to their age in completed years:
+```json
+{
+  "PATIENT_ID_1": 68,
+  "PATIENT_ID_2": 74
+}
+```
+- Age is computed in completed years relative to the current date, or relative to the date of death (`date_of_death`) if the patient is deceased.
+- Includes all patients with known date of birth stored in the `Patient` table.
+
 ---
 
 ## Clinical Features (26 vs 44)
@@ -133,4 +144,4 @@ docker compose -f docker-compose-datalake.yml --env-file datalake/.env run --rm 
 The container will:
 1. Connect to PostgreSQL.
 2. Recreate the `datalake_export` database and the `NN_Training_Dataset` table.
-3. Export the 3 CSV files to `service/datalake/backend/patient_csv/NN_Dataset/`.
+3. Export the CSV dataset files and `patient_age.json` to `service/datalake/backend/patient_csv/NN_Dataset/`.

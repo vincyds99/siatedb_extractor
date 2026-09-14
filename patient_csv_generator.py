@@ -3,10 +3,12 @@ import os
 import sys
 import time
 import re
+import json
 import psycopg2
 import csv
 import gc
 import math
+from datetime import datetime, date
 from pathlib import Path
 from psycopg2 import sql
 from operator import itemgetter
@@ -898,6 +900,70 @@ def export_nn_training_datasets(cur, dest_conn):
 
     print(f"[python-runner] Successfully exported all {len(files_info)} dataset files in {nn_dir}!")
 
+def compute_age(dob, dod=None, ref_date=None):
+    if ref_date is None:
+        ref_date = date.today()
+    elif isinstance(ref_date, datetime):
+        ref_date = ref_date.date()
+
+    def to_date(val):
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            return val.date()
+        if isinstance(val, date):
+            return val
+        if isinstance(val, str):
+            s = val.strip().strip('"').strip("'")
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    return datetime.strptime(s.split('.')[0], fmt).date()
+                except ValueError:
+                    continue
+            try:
+                return datetime.fromisoformat(s).date()
+            except Exception:
+                return None
+        return None
+
+    dob_date = to_date(dob)
+    if dob_date is None:
+        return None
+
+    dod_date = to_date(dod)
+    target_date = dod_date if dod_date is not None else ref_date
+
+    age = target_date.year - dob_date.year - ((target_date.month, target_date.day) < (dob_date.month, dob_date.day))
+    return max(0, age)
+
+def export_patient_age_json(cur, dest_conn):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    nn_dir = os.path.join(script_dir, "NN_Dataset")
+    os.makedirs(nn_dir, exist_ok=True)
+    json_path = os.path.join(nn_dir, "patient_age.json")
+
+    print(f"[python-runner] Exporting patient ages to {json_path}...")
+    cur.execute("""
+        SELECT patient_id, date_of_birth, date_of_death 
+        FROM Patient 
+        WHERE date_of_birth IS NOT NULL
+        ORDER BY patient_id;
+    """)
+    rows = cur.fetchall()
+
+    today = date.today()
+    patient_ages = {}
+    for pid, dob, dod in rows:
+        clean_pid = pid.strip() if isinstance(pid, str) else str(pid)
+        age = compute_age(dob, dod, ref_date=today)
+        if age is not None:
+            patient_ages[clean_pid] = age
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(patient_ages, f, indent=2)
+
+    print(f"[python-runner] Successfully exported {len(patient_ages)} patient ages to {json_path}!")
+
 def main():
     DB_HOST = get_env('DB_HOST', 'datalake_backend_db')
     DB_PORT = get_env('DB_PORT', '5432')
@@ -1009,6 +1075,9 @@ def main():
 
             print("[python-runner] Exporting NN datasets to CSV files in NN_Dataset/...")
             export_nn_training_datasets(cur, dest_conn)
+
+            print("[python-runner] Exporting patient ages to JSON in NN_Dataset/...")
+            export_patient_age_json(cur, dest_conn)
 
     except Exception as e:
         print(f"[python-runner] Destination DB error: {e}")
