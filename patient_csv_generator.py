@@ -12,7 +12,7 @@ from datetime import datetime, date
 from pathlib import Path
 from psycopg2 import sql
 from operator import itemgetter
-from collections import defaultdict, deque
+from collections import defaultdict
 from psycopg2.extras import execute_values
 
 # Define the list of allowed features for the neural network (request of the professor)
@@ -286,9 +286,6 @@ def create_domains_and_tables(cur):
         patient_id String4PatientId NOT NULL,
         history_days INTEGER NOT NULL,
         misure DOUBLE PRECISION[] NOT NULL,
-        aggregati_10 DOUBLE PRECISION[] NOT NULL,
-        aggregati_20 DOUBLE PRECISION[] NOT NULL,
-        aggregati_30 DOUBLE PRECISION[] NOT NULL,
         tte INTEGER NOT NULL,
         log_tte DOUBLE PRECISION NOT NULL,
         tte_uncapped INTEGER NOT NULL,
@@ -652,7 +649,6 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
             """, (clean_pid,))
 
             last_values = {vid: var_defaults[vid] for vid in var_ids}
-            window = deque(maxlen=30) 
             
             current_time = None
             current_session_vals = {}
@@ -667,7 +663,6 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
                 for vid, v in vals.items():
                     last_values[vid] = v
                 vector = [last_values[vid] for vid in var_ids]
-                window.append(vector)
                 
                 if time_stamp not in valid_timestamps:
                     return
@@ -697,19 +692,12 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
                 log_tte_capped = round(math.log(tte_capped), 6)
                 log_tte_uncapped = round(math.log(tte_uncapped), 6)
 
-                w_list = list(window)
-                w_len = len(w_list)
-                l10, l20, l30 = min(10, w_len), min(20, w_len), min(30, w_len)
-                agg_10 = [sum(w[j] for w in w_list[-10:]) / l10 for j in range(num_vars)]
-                agg_20 = [sum(w[j] for w in w_list[-20:]) / l20 for j in range(num_vars)]
-                agg_30 = [sum(w[j] for w in w_list[-30:]) / l30 for j in range(num_vars)]
-
-                rows_to_insert.append((time_stamp, clean_pid, history_days, vector, agg_10, agg_20, agg_30, 
+                rows_to_insert.append((time_stamp, clean_pid, history_days, vector, 
                                        tte_capped, log_tte_capped, tte_uncapped, log_tte_uncapped))
 
                 if len(rows_to_insert) >= chunk_size:
                     execute_values(write_cur, """
-                        INSERT INTO NN_Training_Dataset (timestamp, patient_id, history_days, misure, aggregati_10, aggregati_20, aggregati_30, 
+                        INSERT INTO NN_Training_Dataset (timestamp, patient_id, history_days, misure, 
                                                          tte, log_tte, tte_uncapped, log_tte_uncapped)
                         VALUES %s
                         ON CONFLICT (timestamp, patient_id) DO NOTHING;
@@ -731,7 +719,7 @@ def process_patient_optimized(patient_id, pat_critical_events, var_ids, var_defa
 
             if rows_to_insert:
                 execute_values(write_cur, """
-                    INSERT INTO NN_Training_Dataset (timestamp, patient_id, history_days, misure, aggregati_10, aggregati_20, aggregati_30, 
+                    INSERT INTO NN_Training_Dataset (timestamp, patient_id, history_days, misure, 
                                                      tte, log_tte, tte_uncapped, log_tte_uncapped)
                     VALUES %s
                     ON CONFLICT (timestamp, patient_id) DO NOTHING;
@@ -825,7 +813,7 @@ def export_nn_training_datasets(cur, dest_conn):
 
     open_files = []
     writers = []
-    header = ["timestamp", "patient_id", "misure", "aggregati_10", "aggregati_20", "aggregati_30", "tte", "log_tte"]
+    header = ["timestamp", "patient_id", "misure", "tte", "log_tte"]
 
     for filename, _, _, _ in files_info:
         file_path = os.path.join(nn_dir, filename)
@@ -842,7 +830,7 @@ def export_nn_training_datasets(cur, dest_conn):
     with dest_conn.cursor(name='export_stream_cursor') as stream_cur:
         stream_cur.itersize = 5000
         stream_cur.execute("""
-            SELECT timestamp, patient_id, history_days, misure, aggregati_10, aggregati_20, aggregati_30, 
+            SELECT timestamp, patient_id, history_days, misure, 
                    tte, log_tte, tte_uncapped, log_tte_uncapped 
             FROM NN_Training_Dataset 
             ORDER BY patient_id, timestamp;
@@ -851,23 +839,12 @@ def export_nn_training_datasets(cur, dest_conn):
         count = 0
         file_counts = [0] * len(files_info)
         for row in stream_cur:
-            ts, pid, h_days, m, a10, a20, a30, tte_c, log_c, tte_u, log_u = row
+            ts, pid, h_days, m, tte_c, log_c, tte_u, log_u = row
             clean_pid = pid.strip() if isinstance(pid, str) else pid
 
             m_44 = "{" + ",".join(str(m[i]) for i in idx_44) + "}"
-            a10_44 = "{" + ",".join(str(a10[i]) for i in idx_44) + "}"
-            a20_44 = "{" + ",".join(str(a20[i]) for i in idx_44) + "}"
-            a30_44 = "{" + ",".join(str(a30[i]) for i in idx_44) + "}"
-
             m_26 = "{" + ",".join(str(m[i]) for i in idx_26) + "}"
-            a10_26 = "{" + ",".join(str(a10[i]) for i in idx_26) + "}"
-            a20_26 = "{" + ",".join(str(a20[i]) for i in idx_26) + "}"
-            a30_26 = "{" + ",".join(str(a30[i]) for i in idx_26) + "}"
-
             m_av = "{" + ",".join(str(m[i]) for i in idx_av) + "}"
-            a10_av = "{" + ",".join(str(a10[i]) for i in idx_av) + "}"
-            a20_av = "{" + ",".join(str(a20[i]) for i in idx_av) + "}"
-            a30_av = "{" + ",".join(str(a30[i]) for i in idx_av) + "}"
 
             for idx_f, (fname, feat_indices, mode, min_w) in enumerate(files_info):
                 if h_days < min_w:
@@ -875,16 +852,16 @@ def export_nn_training_datasets(cur, dest_conn):
 
                 w = writers[idx_f]
                 if feat_indices is idx_26:
-                    fm, fa10, fa20, fa30 = m_26, a10_26, a20_26, a30_26
+                    fm = m_26
                 elif feat_indices is idx_44:
-                    fm, fa10, fa20, fa30 = m_44, a10_44, a20_44, a30_44
+                    fm = m_44
                 else:
-                    fm, fa10, fa20, fa30 = m_av, a10_av, a20_av, a30_av
+                    fm = m_av
 
                 if mode == "uncapped":
-                    w.writerow([ts, clean_pid, fm, fa10, fa20, fa30, tte_u, log_u])
+                    w.writerow([ts, clean_pid, fm, tte_u, log_u])
                 else:
-                    w.writerow([ts, clean_pid, fm, fa10, fa20, fa30, tte_c, log_c])
+                    w.writerow([ts, clean_pid, fm, tte_c, log_c])
 
                 file_counts[idx_f] += 1
 

@@ -68,15 +68,12 @@ CREATE INDEX idx_timeseries_pid ON TimeSeries (pid);
 
 
 -- Table for dataset of training and testing of neural network models. 
--- Each row corresponds to a patient at a specific timestamp, with the features (misure, aggregati_10, aggregati_20, aggregati_30) and the target variable (tte).
+-- Each row corresponds to a patient at a specific timestamp, with the features (misure) and the target variable (tte).
 CREATE TABLE NN_Training_Dataset (
     timestamp timestamp NOT NULL,
     patient_id String4PatientId NOT NULL,
     history_days INTEGER NOT NULL,            -- days since patient's first dialysis session (>= 30)
     misure DOUBLE PRECISION[] NOT NULL,       -- array of misure (raw measurements) for the patient at the given timestamp
-    aggregati_10 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 10 sessions
-    aggregati_20 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 20 sessions
-    aggregati_30 DOUBLE PRECISION[] NOT NULL, -- array of averages over the last 30 sessions
     tte INTEGER NOT NULL,                     -- Time To Event in days (capped at 360)
     log_tte DOUBLE PRECISION NOT NULL,        -- log(TTE) capped
     tte_uncapped INTEGER NOT NULL,            -- Time To Event in days (uncapped)

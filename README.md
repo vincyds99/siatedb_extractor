@@ -49,12 +49,11 @@ The critical adverse events considered are:
 - All events recorded on or before the patient's first dialysis session (e.g. vascular access placement/admission on Day 0) are considered in the past and are **ignored**.
 - For each evaluated session, the target event is the **next critical event strictly in the future** (`event_date > session_date`).
 
-### 3. Sliding Window & History Inclusion Criterion ($W=30$ and $W=60$ days)
+### 3. History Inclusion Criterion ($W=30$ and $W=60$ days)
 - A session is included in the training dataset only if the patient has a historical observation window of at least $W$ calendar days prior to the session:
   $$\text{session\_date} - \text{first\_dialysis\_date} \ge W \text{ days}$$
 - There must exist at least one previous session older than the evaluated session by at least $W$ days.
 - The pipeline supports two observation windows: **$W = 30$ days** and **$W = 60$ days**.
-- The historical rolling averages (`aggregati_10`, `aggregati_20`, `aggregati_30`) are computed over the available sliding window history.
 
 ### 4. Calculation of TTE and Logarithmic Target
 - Because the future event occurs strictly after the session date, the time distance is naturally $\ge 1$ day (without artificial clamping).
@@ -93,14 +92,11 @@ The pipeline generates the **6 official datasets** (3 for $W=30$ and 3 for $W=60
 
 ### CSV Column Structure
 ```csv
-timestamp,patient_id,misure,aggregati_10,aggregati_20,aggregati_30,tte,log_tte
+timestamp,patient_id,misure,tte,log_tte
 ```
 - `timestamp`: dialysis session timestamp.
 - `patient_id`: unique patient identifier.
 - `misure`: array of current session feature values.
-- `aggregati_10`: array of rolling averages over the last 10 sessions.
-- `aggregati_20`: array of rolling averages over the last 20 sessions.
-- `aggregati_30`: array of rolling averages over the last 30 sessions.
 - `tte`: Time-To-Event in days.
 - `log_tte`: natural logarithm of the Time-To-Event ($\ln(\text{TTE})$).
 
