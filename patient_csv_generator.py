@@ -17,7 +17,7 @@ from psycopg2.extras import execute_values
 
 # Define the list of allowed features for the neural network (request of the professor)
 ALLOWED_NN_PROPS = {
-    # Raw properties (15)
+    # Raw properties (15 in TimeVar)
     "Arter", "Azotemia Post", "Azotemia Pre", "BCM post", "BMI", 
     "FFM post", "FM post", "Peso Post", "Peso Pre", "QB Medio", 
     "QB Totale", "Score CVC", "Score FAV", "Tipo Accesso Vascolare", 
@@ -34,6 +34,30 @@ VASCULAR_ACCESS_PROPS = {
     # Dependent properties (6)
     "A/V", "Mesi CVC", "Mesi FAV", "PA/QB", "PV/QB", "QB"
 }
+
+# Anemia features subset (8 properties)
+ANEMIA_PROPS = {
+    # Raw properties (5)
+    "Hb", "Ferritina", "Sideremia", "Transferrina", "Dosaggio Epoetina Alpha mensile",
+    # Dependent properties (3)
+    "Alpha EPODose Weight", "Alpha ERI", "TSAT"
+}
+
+# Nutrition features subset (11 properties)
+NUTRIZIONE_PROPS = {
+    # Raw properties (11)
+    "Albuminemia", "Colesterolemia", "Circonferenza Braccio", "DEI", "DPI",
+    "BMI", "BCM post", "FFM post", "FM post", "Azotemia Pre", "Azotemia Post"
+}
+
+# Metabolism features subset (CKD-MBD) (7 properties)
+METABOLISMO_PROPS = {
+    # Raw properties (6)
+    "Calcemia", "Fosforemia", "PTH", "Fosfatasi Alcalina", "Vitamina D", "Bicarbonatemia",
+    # Dependent properties (1)
+    "FosfAlcIndex"
+}
+
 
 # get environment variable with optional default and required flag
 def get_env(name, default=None, required=False):
@@ -792,30 +816,60 @@ def export_nn_training_datasets(cur, dest_conn):
     idx_44 = list(range(len(var_names)))
     idx_26 = [i for i, name in enumerate(var_names) if name in ALLOWED_NN_PROPS]
     idx_av = [i for i, name in enumerate(var_names) if name in VASCULAR_ACCESS_PROPS]
+    idx_anemia = [i for i, name in enumerate(var_names) if name in ANEMIA_PROPS]
+    idx_nutrizione = [i for i, name in enumerate(var_names) if name in NUTRIZIONE_PROPS]
+    idx_metabolismo = [i for i, name in enumerate(var_names) if name in METABOLISMO_PROPS]
 
-    print(f"[python-runner] Features mapping: {len(idx_44)} all clinical, {len(idx_26)} standard allowed (26), {len(idx_av)} vascular access only (12).")
+    print(f"[python-runner] Features mapping: {len(idx_44)} all clinical (44), {len(idx_26)} vascular access standard (26), {len(idx_av)} vascular access only (12), {len(idx_anemia)} anemia (8), {len(idx_nutrizione)} nutrizione (11), {len(idx_metabolismo)} metabolismo (7).")
 
-    # Defined output files: 6 datasets (W=30 and W=60) + standard default aliases (W=30)
+    # Defined output files: 5 feature sets (26, 44, anemia, nutrizione, metabolismo) x 4 variants (W30/W60, capped/uncapped) + default aliases (W30)
     files_info = [
-        # W = 30 days
-        ("NN_training_dataset_W30_26_uncapped.csv", idx_26, "uncapped", 30),
-        ("NN_training_dataset_W30_26_capped360.csv", idx_26, "capped", 30),
-        ("NN_training_dataset_W30_44_capped360.csv", idx_44, "capped", 30),
-        # W = 60 days
-        ("NN_training_dataset_W60_26_uncapped.csv", idx_26, "uncapped", 60),
-        ("NN_training_dataset_W60_26_capped360.csv", idx_26, "capped", 60),
-        ("NN_training_dataset_W60_44_capped360.csv", idx_44, "capped", 60),
-        # Default aliases (W = 30)
-        ("NN_training_dataset_26_uncapped.csv", idx_26, "uncapped", 30),
-        ("NN_training_dataset_26_capped360.csv", idx_26, "capped", 30),
-        ("NN_training_dataset_44_capped360.csv", idx_44, "capped", 30),
+        # --- Accesso Vascolare (26 parameters) ---
+        ("NN_training_dataset_W30_26_uncapped.csv", "26", idx_26, "uncapped", 30),
+        ("NN_training_dataset_W30_26_capped360.csv", "26", idx_26, "capped", 30),
+        ("NN_training_dataset_W60_26_uncapped.csv", "26", idx_26, "uncapped", 60),
+        ("NN_training_dataset_W60_26_capped360.csv", "26", idx_26, "capped", 60),
+        ("NN_training_dataset_26_uncapped.csv", "26", idx_26, "uncapped", 30),
+        ("NN_training_dataset_26_capped360.csv", "26", idx_26, "capped", 30),
+
+        # --- Tutti i Parametri (44 parameters) ---
+        ("NN_training_dataset_W30_44_uncapped.csv", "44", idx_44, "uncapped", 30),
+        ("NN_training_dataset_W30_44_capped360.csv", "44", idx_44, "capped", 30),
+        ("NN_training_dataset_W60_44_uncapped.csv", "44", idx_44, "uncapped", 60),
+        ("NN_training_dataset_W60_44_capped360.csv", "44", idx_44, "capped", 60),
+        ("NN_training_dataset_44_uncapped.csv", "44", idx_44, "uncapped", 30),
+        ("NN_training_dataset_44_capped360.csv", "44", idx_44, "capped", 30),
+
+        # --- Anemia (8 parameters) ---
+        ("NN_training_dataset_W30_anemia_uncapped.csv", "anemia", idx_anemia, "uncapped", 30),
+        ("NN_training_dataset_W30_anemia_capped360.csv", "anemia", idx_anemia, "capped", 30),
+        ("NN_training_dataset_W60_anemia_uncapped.csv", "anemia", idx_anemia, "uncapped", 60),
+        ("NN_training_dataset_W60_anemia_capped360.csv", "anemia", idx_anemia, "capped", 60),
+        ("NN_training_dataset_anemia_uncapped.csv", "anemia", idx_anemia, "uncapped", 30),
+        ("NN_training_dataset_anemia_capped360.csv", "anemia", idx_anemia, "capped", 30),
+
+        # --- Nutrizione (11 parameters) ---
+        ("NN_training_dataset_W30_nutrizione_uncapped.csv", "nutrizione", idx_nutrizione, "uncapped", 30),
+        ("NN_training_dataset_W30_nutrizione_capped360.csv", "nutrizione", idx_nutrizione, "capped", 30),
+        ("NN_training_dataset_W60_nutrizione_uncapped.csv", "nutrizione", idx_nutrizione, "uncapped", 60),
+        ("NN_training_dataset_W60_nutrizione_capped360.csv", "nutrizione", idx_nutrizione, "capped", 60),
+        ("NN_training_dataset_nutrizione_uncapped.csv", "nutrizione", idx_nutrizione, "uncapped", 30),
+        ("NN_training_dataset_nutrizione_capped360.csv", "nutrizione", idx_nutrizione, "capped", 30),
+
+        # --- Metabolismo (7 parameters) ---
+        ("NN_training_dataset_W30_metabolismo_uncapped.csv", "metabolismo", idx_metabolismo, "uncapped", 30),
+        ("NN_training_dataset_W30_metabolismo_capped360.csv", "metabolismo", idx_metabolismo, "capped", 30),
+        ("NN_training_dataset_W60_metabolismo_uncapped.csv", "metabolismo", idx_metabolismo, "uncapped", 60),
+        ("NN_training_dataset_W60_metabolismo_capped360.csv", "metabolismo", idx_metabolismo, "capped", 60),
+        ("NN_training_dataset_metabolismo_uncapped.csv", "metabolismo", idx_metabolismo, "uncapped", 30),
+        ("NN_training_dataset_metabolismo_capped360.csv", "metabolismo", idx_metabolismo, "capped", 30),
     ]
 
     open_files = []
     writers = []
     header = ["timestamp", "patient_id", "misure", "tte", "log_tte"]
 
-    for filename, _, _, _ in files_info:
+    for filename, _, _, _, _ in files_info:
         file_path = os.path.join(nn_dir, filename)
         if os.path.exists(file_path):
             print(f"[python-runner] Removing existing CSV file: {file_path}")
@@ -842,22 +896,16 @@ def export_nn_training_datasets(cur, dest_conn):
             ts, pid, h_days, m, tte_c, log_c, tte_u, log_u = row
             clean_pid = pid.strip() if isinstance(pid, str) else pid
 
-            m_44 = "{" + ",".join(str(m[i]) for i in idx_44) + "}"
-            m_26 = "{" + ",".join(str(m[i]) for i in idx_26) + "}"
-            m_av = "{" + ",".join(str(m[i]) for i in idx_av) + "}"
-
-            for idx_f, (fname, feat_indices, mode, min_w) in enumerate(files_info):
+            formatted_cache = {}
+            for idx_f, (fname, cat_key, feat_indices, mode, min_w) in enumerate(files_info):
                 if h_days < min_w:
                     continue
 
-                w = writers[idx_f]
-                if feat_indices is idx_26:
-                    fm = m_26
-                elif feat_indices is idx_44:
-                    fm = m_44
-                else:
-                    fm = m_av
+                if cat_key not in formatted_cache:
+                    formatted_cache[cat_key] = "{" + ",".join(str(m[i]) for i in feat_indices) + "}"
+                fm = formatted_cache[cat_key]
 
+                w = writers[idx_f]
                 if mode == "uncapped":
                     w.writerow([ts, clean_pid, fm, tte_u, log_u])
                 else:
@@ -872,10 +920,11 @@ def export_nn_training_datasets(cur, dest_conn):
     for f in open_files:
         f.close()
 
-    for idx_f, (fname, _, _, _) in enumerate(files_info):
+    for idx_f, (fname, _, _, _, _) in enumerate(files_info):
         print(f"[python-runner] File '{fname}': {file_counts[idx_f]} rows written.")
 
     print(f"[python-runner] Successfully exported all {len(files_info)} dataset files in {nn_dir}!")
+
 
 def compute_age(dob, dod=None, ref_date=None):
     if ref_date is None:
@@ -957,6 +1006,24 @@ def main():
     ready = wait_for_db(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, timeout=60, interval=2)
     if not ready:
         sys.exit(1)
+
+    export_only = os.environ.get("EXPORT_ONLY", "").lower() in ("1", "true", "yes") or "--export-only" in sys.argv
+    if export_only:
+        print(f"[python-runner] EXPORT_ONLY flag detected: skipping data pipeline and exporting CSV datasets from '{NEW_DB_NAME}'...")
+        try:
+            dest_conn = connect(NEW_DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+            with dest_conn.cursor() as cur:
+                print("[python-runner] Exporting NN datasets to CSV files in NN_Dataset/...")
+                export_nn_training_datasets(cur, dest_conn)
+                print("[python-runner] Exporting patient ages to JSON in NN_Dataset/...")
+                export_patient_age_json(cur, dest_conn)
+            dest_conn.close()
+            print("[python-runner] Export-only operation completed successfully!")
+            return
+        except Exception as e:
+            print(f"[python-runner] Export error: {e}")
+            sys.exit(1)
+
 
     try:
         src_conn = connect(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
